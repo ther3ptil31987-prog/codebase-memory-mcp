@@ -26,8 +26,10 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "repro_runner.h"
 #include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
+#include "daemon/bootstrap.h"  /* refuse the developer's default daemon rendezvous */
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
@@ -131,6 +133,15 @@ int main(void) {
      * supervisor gate already ignores unmarked hosts; pin the kill switch too.
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* No reproduction needs the daemon rendezvous. Its default is the
+     * developer's live daemon whatever HOME says, so a case that ever resolves
+     * an endpoint without an explicit parent or CBM_RUNTIME_DIR is refused
+     * loudly instead of reaching it. */
+    cbm_daemon_bootstrap_forbid_default_runtime_for_test(true);
+#endif
+    /* #2003: fixture git commands must never reach the caller's repository. */
+    th_clear_git_repo_env();
 
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the

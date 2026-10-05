@@ -74,6 +74,9 @@ typedef struct {
     size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
                                       * 0 => no OS-enforced memory limit */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
+    bool strip_git_repo_env;         /* child env omits git's repository-local variables
+                                      * (foundation/git_env.h) — set for every git spawn so
+                                      * an inherited GIT_DIR never overrides `git -C` */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
@@ -188,6 +191,23 @@ bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable
  * of hoping a loaded machine reproduces it. Test builds only. */
 void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
 int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+#endif
+
+/* How the POSIX fork+exec child closed its inherited descriptors (#1484). */
+typedef enum {
+    CBM_FD_CLOSE_RANGE = 1, /* Linux close_range(2): one syscall */
+    CBM_FD_CLOSEFROM,       /* BSD closefrom(3): one call */
+    CBM_FD_CLOSE_LOOP       /* close() per descriptor up to _SC_OPEN_MAX: O(RLIMIT_NOFILE) */
+} cbm_fd_close_strategy_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* Run the child's close-inherited-descriptors step in the CALLING process for
+ * descriptors >= lowfd (callers pick a lowfd above everything they need) and
+ * report which strategy did the work. Test builds only. */
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd);
+/* Make the close_range fast path behave as if the kernel lacked it (ENOSYS),
+ * so the fallback loop is exercised deterministically. Test builds only. */
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force);
 #endif
 
 #endif /* CBM_SUBPROCESS_H */

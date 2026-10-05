@@ -1025,6 +1025,53 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
     return cbm_type_named(ctx->arena, name);
 }
 
+/* Resolve the class of a qualified member `Scope::member` -- scope_qn is the
+ * dotted scope ("SecdManager", "ns.Widget") -- to the QN of ONE registered
+ * class, or NULL. The bare and caller-module spellings come first. A class
+ * declared in another file is registered under that file's module
+ * ("<proj>.app.src.SecdManager.SecdManager"), which neither spelling reaches,
+ * so then every registered type whose QN ends in ".<scope_qn>" at a segment
+ * boundary is a candidate. More than one distinct candidate (two libraries
+ * each declaring `Twin`) names no single class: the call stays unresolved
+ * rather than bind one of them by guess. */
+static const char *c_resolve_scope_class_qn(CLSPContext *ctx, const char *scope_qn) {
+    if (!ctx->registry || !scope_qn || !scope_qn[0]) {
+        return NULL;
+    }
+    if (cbm_registry_lookup_type(ctx->registry, scope_qn)) {
+        return scope_qn;
+    }
+    if (ctx->module_qn) {
+        const char *mod_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, scope_qn);
+        if (cbm_registry_lookup_type(ctx->registry, mod_qn)) {
+            return mod_qn;
+        }
+    }
+    const char *last_dot = strrchr(scope_qn, '.');
+    const char *short_name = last_dot ? last_dot + 1 : scope_qn;
+    size_t scope_len = strlen(scope_qn);
+    const char *found = NULL;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, short_name, &it);
+    int i;
+    while ((i = cbm_type_short_iter_next(&it)) >= 0) {
+        const char *q = it.reg->types[i].qualified_name;
+        size_t qlen = q ? strlen(q) : 0;
+        if (qlen <= scope_len || q[qlen - scope_len - 1] != '.' ||
+            strcmp(q + qlen - scope_len, scope_qn) != 0) {
+            continue;
+        }
+        if (found && strcmp(found, q) != 0) {
+            return NULL;
+        }
+        found = q;
+    }
+    return found;
+}
+
+static const CBMRegisteredFunc *c_lookup_scope_member(CLSPContext *ctx, const char *class_qn,
+                                                      const char *member_name);
+
 // ============================================================================
 // c_parse_type_node: AST type node -> CBMType
 // ============================================================================
@@ -1820,6 +1867,16 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
                         }
                     }
                 }
+            }
+
+            // Class::member of a class declared in another file: its signature
+            // carries the return type a chained or auto receiver dispatches on.
+            const char *scope_class =
+                c_resolve_scope_class_qn(ctx, cbm_arena_strndup(ctx->arena, qn, prefix_len));
+            const CBMRegisteredFunc *sm =
+                scope_class ? c_lookup_scope_member(ctx, scope_class, dot + 1) : NULL;
+            if (sm && sm->signature) {
+                return sm->signature;
             }
         }
 
@@ -2860,6 +2917,15 @@ const CBMRegisteredFunc *c_lookup_member(CLSPContext *ctx, const char *type_qn,
     return c_lookup_member_depth(ctx, type_qn, member_name, 0);
 }
 
+/* A member of a class c_resolve_scope_class_qn already pinned down: direct,
+ * then through its aliases and base classes. Entering below depth 0 skips the
+ * short-name fallback, which would re-anchor the lookup onto a same-named
+ * class elsewhere -- the scope names exactly this class. */
+static const CBMRegisteredFunc *c_lookup_scope_member(CLSPContext *ctx, const char *class_qn,
+                                                      const char *member_name) {
+    return c_lookup_member_depth(ctx, class_qn, member_name, 1);
+}
+
 // True if any BASE class of type_qn (not type_qn itself) declares member_name —
 // i.e. a method found directly on type_qn is an OVERRIDE of an inherited method.
 // This mirrors the existing virtual-dispatch notion (a derived override of a base
@@ -2878,6 +2944,23 @@ static bool c_base_declares_member(CLSPContext *ctx, const char *type_qn, const 
             return true;
     }
     return false;
+}
+
+/* Type of the idx-th declared field, for structured-binding decomposition.
+ * field_types[] is parallel to field_names[] and may hold NULL entries, so
+ * only field_names[] bounds it: a binding list longer than the field list
+ * (ill-formed, but present in compiler test suites) must yield NULL, never
+ * read past the array into the next arena object (#1743). */
+static const CBMType *c_struct_field_type_at(const CBMRegisteredType *rt, int idx) {
+    if (!rt || !rt->field_names || !rt->field_types || idx < 0) {
+        return NULL;
+    }
+    for (int i = 0; i < idx; i++) {
+        if (!rt->field_names[i]) {
+            return NULL;
+        }
+    }
+    return rt->field_names[idx] ? rt->field_types[idx] : NULL;
 }
 
 // Field type lookup
@@ -3055,9 +3138,10 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                                     ctx->registry,
                                                     cbm_arena_sprintf(ctx->arena, "%s.%s",
                                                                       ctx->module_qn, rhs_qn));
-                                            if (rt && rt->field_types &&
-                                                rt->field_types[binding_idx])
-                                                elem_type = rt->field_types[binding_idx];
+                                            const CBMType *ft =
+                                                c_struct_field_type_at(rt, binding_idx);
+                                            if (ft)
+                                                elem_type = ft;
                                         }
                                         cbm_scope_bind(ctx->current_scope, bname, elem_type);
                                         binding_idx++;
@@ -3140,8 +3224,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                             ctx->registry,
                                             cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
                                                               rhs_qn));
-                                    if (rt && rt->field_types && rt->field_types[binding_idx]) {
-                                        elem_type = rt->field_types[binding_idx];
+                                    const CBMType *ft = c_struct_field_type_at(rt, binding_idx);
+                                    if (ft) {
+                                        elem_type = ft;
                                     }
                                 }
                                 cbm_scope_bind(ctx->current_scope, bname, elem_type);
@@ -3551,8 +3636,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                 rt = cbm_registry_lookup_type(
                                     ctx->registry,
                                     cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, eq));
-                            if (rt && rt->field_types && rt->field_types[binding_idx])
-                                bt = rt->field_types[binding_idx];
+                            const CBMType *ft = c_struct_field_type_at(rt, binding_idx);
+                            if (ft)
+                                bt = ft;
                         }
                         cbm_scope_bind(ctx->current_scope, bname, bt);
                         binding_idx++;
@@ -4118,6 +4204,24 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         }
                         if (nf) {
                             c_emit_resolved_call_at(ctx, nf->qualified_name, "lsp_scoped", 0.90f,
+                                                    node);
+                            goto recurse;
+                        }
+                    }
+                    // Class::method of a class declared in another file (#1153).
+                    if (dot) {
+                        const char *scope_class = c_resolve_scope_class_qn(
+                            ctx, cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn)));
+                        const CBMRegisteredFunc *sm = NULL;
+                        if (scope_class) {
+                            sm = cbm_registry_lookup_method_by_types(ctx->registry, scope_class,
+                                                                     dot + 1, arg_types, arg_count);
+                            if (!sm) {
+                                sm = c_lookup_scope_member(ctx, scope_class, dot + 1);
+                            }
+                        }
+                        if (sm) {
+                            c_emit_resolved_call_at(ctx, sm->qualified_name, "lsp_scoped", 0.95f,
                                                     node);
                             goto recurse;
                         }

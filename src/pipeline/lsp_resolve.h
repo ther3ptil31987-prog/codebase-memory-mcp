@@ -22,6 +22,7 @@
 #define CBM_PIPELINE_LSP_RESOLVE_H
 
 #include "cbm.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len — leaf splitters skip the suffix */
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 
@@ -64,7 +65,10 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
         return name;
     }
     const char *seg = name;
-    for (const char *p = name; *p; p++) {
+    /* Scan the base only: a callable identity suffix (#2061) belongs to the
+     * leaf and may itself contain ':' (Swift labels) or '>' (generics). */
+    const char *end = name + cbm_qn_callable_base_len(name);
+    for (const char *p = name; p < end; p++) {
         /* '.' (dotted QN / Java-style member) and ':' (C++ `::`, last colon
          * wins) are member/scope separators. '>' is only a separator when it
          * closes the `->` arrow (preceded by '-'); a bare '>' closes a template
@@ -86,7 +90,15 @@ static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
     if (!qn) {
         return NULL;
     }
-    const char *last = strrchr(qn, '.');
+    /* The last '.' of the BASE QN: a callable identity suffix (#2061) never
+     * contains '.', so this is the historical strrchr for every QN. */
+    const char *last = NULL;
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            last = qn + i;
+        }
+    }
     if (!last || last == qn) {
         return NULL;
     }
@@ -535,6 +547,47 @@ static inline bool cbm_pipeline_kotlin_external_target(CBMLanguage lang, const c
     return strncmp(callee_qn, "kotlin.", strlen("kotlin.")) == 0 ||
            strncmp(callee_qn, "java.", strlen("java.")) == 0 ||
            strncmp(callee_qn, "javax.", strlen("javax.")) == 0;
+}
+
+/* Rust (#2053): true when the Rust LSP positively resolved a call to a
+ * registered symbol that lives OUTSIDE the project — a std/core/alloc seed
+ * method (`root.join()` on `root: &Path` -> std.path.Path.join) or a seeded
+ * crate API. Such a row has no graph node, and before this gate the callers
+ * then fell back to the textual registry, which bound the call to whatever
+ * project method shares the leaf name (EvidenceTier::join, unique_name).
+ *
+ * The evidence is the strategy plus the QN's namespace. The listed strategies
+ * emit the QN of a function the LSP registry actually holds; project defs are
+ * registered under their project-prefixed QNs, so a registered QN outside the
+ * project prefix is an embedded seed by construction. A project-prefixed QN
+ * that merely failed the gbuf lookup is NOT external and keeps the #1085
+ * registry fallback, as does every unresolved/unknown-receiver row (those
+ * never reach the callers: they sit below CBM_LSP_CONFIDENCE_FLOOR).
+ * Rust-only: suppressors stay per-language. Pure; unit-tested. */
+static inline bool cbm_pipeline_rust_external_target(CBMLanguage lang, const char *strategy,
+                                                     const char *callee_qn,
+                                                     const char *project_name) {
+    if (lang != CBM_LANG_RUST || !strategy || !callee_qn || !callee_qn[0] || !project_name ||
+        !project_name[0]) {
+        return false;
+    }
+    static const char *const registered_target_strategies[] = {
+        "lsp_method_dispatch", "lsp_trait_dispatch", "lsp_deref_dispatch", "lsp_bound_dispatch",
+        "lsp_direct",          "lsp_ufcs",           "lsp_constructor",
+    };
+    bool registered_target = false;
+    for (size_t i = 0;
+         i < sizeof(registered_target_strategies) / sizeof(registered_target_strategies[0]); i++) {
+        if (strcmp(strategy, registered_target_strategies[i]) == 0) {
+            registered_target = true;
+            break;
+        }
+    }
+    if (!registered_target) {
+        return false;
+    }
+    size_t proj_len = strlen(project_name);
+    return !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
 }
 
 /* Resolvers may report one graph target both project-relative and already

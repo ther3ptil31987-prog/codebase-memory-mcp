@@ -23,7 +23,10 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
+ * (5 s). Passed as cbm_extract_file*()'s timeout_micros; a generous wall-clock
+ * ceiling (CBM_PARSE_WALL_CEILING_FACTOR x, ~60 s) backstops a stuck parse.
+ * It is a time budget, not a byte budget. */
 #define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
@@ -211,6 +214,21 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path);
 
+/* #1916: HTTP client-instance calls. When `call` is `<recv>.<verb>(url)` with
+ * an HTTP verb suffix and a path/URL first argument, and `recv` is bound —
+ * in the calling module itself, or via an ES import (named or default) — to a
+ * binding the extractor marked as an `axios.create(...)` instance
+ * (`http_client` node property), write the request URL to `out` (the
+ * instance's literal `http_base_url` joined with a '/'-leading path, the path
+ * unchanged when the base is unknown or the URL is absolute) and return true.
+ * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
+ * route-registration or registry fallback, so a wrapper client's `api.get`
+ * is never mistaken for an Express `app.get` route registration. */
+bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                       const CBMFileResult *result, const char **imp_keys,
+                                       const char **imp_vals, int imp_count, const CBMCall *call,
+                                       char *out, size_t out_sz);
+
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
  * Resolution order (first hit wins):
@@ -238,6 +256,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+/* The same map built from the namespace names directly. The parallel pass needs
+ * this: results it has spilled are NULL in its cache, and a file missing from
+ * the map does not fail to resolve -- it resolves through the looser fallback,
+ * so an incomplete map CHANGES the graph instead of shrinking it. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -274,6 +299,23 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
  * is external and the correct result is no edge. Pure; exercised through
  * ei_go_import_never_binds_symbol. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
+
+/* #2127: true when the module segments preceding `name` in a Python import
+ * path (`unittest.mock.patch` -> unittest, mock) occur, in order, among the
+ * enclosing segments of `hit_qn`. Leading relative dots and ` as alias` are
+ * ignored; a path with no module chain before `name` always matches. Gates
+ * the import resolver's symbol-name fallback for Python. */
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn);
+
+/* #2127: true when the callee's root identifier is bound by the file's Python
+ * imports and every such binding is EXTERNAL (no IMPORTS edge from `rel_path`
+ * in `gbuf` carries its local name; NULL gbuf = none) with a module chain that
+ * contradicts `resolved_qn`. Feeds cbm_suppress_weak_import_bound_call at both
+ * resolver call sites. */
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path);
 
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
@@ -658,6 +700,9 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
+int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 
@@ -774,7 +819,7 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
                                            const cbm_file_hash_t *right, int right_count);
 /* Re-run discovery and hash its exact semantic inputs. Used at the publication
  * boundary so late additions/deletions cannot escape a frozen file list. */
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
@@ -867,6 +912,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

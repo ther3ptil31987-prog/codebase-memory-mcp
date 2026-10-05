@@ -12,17 +12,27 @@
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#if !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_close_range 436
+#endif
+#endif
 #else
 #include <windows.h>
 #include "../src/foundation/win_utf8.h"
@@ -1008,6 +1018,94 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #endif
 }
 
+/* #1484: the child's close-inherited-descriptors step must not cost
+ * O(RLIMIT_NOFILE) syscalls. The seam runs the exact child routine in this
+ * process against two descriptors parked at the TOP of the descriptor table
+ * (nothing else lives there), and reports which strategy did the work. On
+ * Linux that must be close_range(2) whenever the kernel has it -- the per-fd
+ * loop is the bug. The ENOSYS-injected leg proves the fallback still closes. */
+#ifndef _WIN32
+static bool subprocess_fd_is_closed(int fd) {
+    return fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+}
+
+static cbm_fd_close_strategy_t subprocess_expected_close_strategy(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* Probe the kernel on an empty range: an old kernel (< 5.9) or a seccomp
+     * filter without it answers ENOSYS/EPERM, and then the loop is correct. */
+    long probe = syscall(SYS_close_range, ~0U, ~0U, 0U);
+    return (probe == 0 || errno == EINVAL) ? CBM_FD_CLOSE_RANGE : CBM_FD_CLOSE_LOOP;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    return CBM_FD_CLOSEFROM;
+#else
+    return CBM_FD_CLOSE_LOOP;
+#endif
+}
+
+/* Park two non-CLOEXEC descriptors near the top of the table; returns the lower
+ * of the two and hands back the original (low) descriptor in *keep_low. The
+ * kernel may cap the table below _SC_OPEN_MAX (macOS: kern.maxfilesperproc),
+ * so the start point halves until F_DUPFD accepts it. */
+static int subprocess_park_high_fds(int *keep_low) {
+    char path[] = "/tmp/cbm-subprocess-highfd-XXXXXX";
+    int low = cbm_mkstemp(path);
+    if (low < 0) {
+        return -1;
+    }
+    (void)unlink(path);
+    long top = sysconf(_SC_OPEN_MAX);
+    if (top <= 0 || top > 1048576L) {
+        top = 1048576L;
+    }
+    int high = -1;
+    for (long base = top - 4; high < 0 && base > 64; base /= 2) {
+        high = fcntl(low, F_DUPFD, (int)base);
+    }
+    int higher = high >= 0 ? fcntl(low, F_DUPFD, high + 1) : -1;
+    if (higher != high + 1) {
+        (void)close(low);
+        if (high >= 0) {
+            (void)close(high);
+        }
+        if (higher >= 0) {
+            (void)close(higher);
+        }
+        return -1;
+    }
+    *keep_low = low;
+    return high;
+}
+#endif
+
+TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork+exec descriptor closing; Windows uses a handle allow-list");
+#else
+    for (int inject_enosys = 0; inject_enosys <= 1; inject_enosys++) {
+        int keep_low = -1;
+        int high = subprocess_park_high_fds(&keep_low);
+        ASSERT_TRUE(high > STDERR_FILENO);
+        cbm_subprocess_force_close_range_enosys_for_testing(inject_enosys != 0);
+        /* The loop bound covers exactly the parked pair; close_range has none. */
+        cbm_fd_close_strategy_t used =
+            cbm_subprocess_close_fds_from_for_testing(high, (long)high + 2);
+        cbm_subprocess_force_close_range_enosys_for_testing(false);
+        bool closed = subprocess_fd_is_closed(high) && subprocess_fd_is_closed(high + 1);
+        bool low_survived = fcntl(keep_low, F_GETFD) >= 0;
+        (void)close(keep_low);
+
+        ASSERT_TRUE(closed);
+        ASSERT_TRUE(low_survived); /* only descriptors >= lowfd are touched */
+        cbm_fd_close_strategy_t expected = subprocess_expected_close_strategy();
+        if (inject_enosys && expected == CBM_FD_CLOSE_RANGE) {
+            expected = CBM_FD_CLOSE_LOOP; /* kernel "lacks" it: the fallback must run */
+        }
+        ASSERT_EQ((int)used, (int)expected);
+    }
+    PASS();
+#endif
+}
+
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
@@ -1256,6 +1354,114 @@ TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
     PASS();
 }
 
+/* ── Git child environment (#2003) ────────────────────────────────────────────
+ * strip_git_repo_env / cbm_popen_git drop every variable of
+ * `git rev-parse --local-env-vars` from the CHILD only: the parent keeps its
+ * environment, other variables pass through, and without the flag a child
+ * still inherits everything. The test sets the variables itself (a runner may
+ * clear them at startup) and restores them before asserting. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} gitenv_snapshot_t;
+
+static void gitenv_enter(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+}
+
+static void gitenv_leave(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+    }
+    unsetenv("CBM_GITENV_KEEP");
+}
+
+/* exit 0: no git repo-local var is set and CBM_GITENV_KEEP=kept; exit 3: a git
+ * var leaked; exit 4: the unrelated variable was lost. */
+static void gitenv_probe_script(char *buf, size_t cap) {
+    size_t n = (size_t)snprintf(buf, cap, "[ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    if (n < cap) {
+        (void)snprintf(buf + n, cap - n, " exit 0");
+    }
+}
+
+static int gitenv_spawn_probe(bool strip) {
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .strip_git_repo_env = strip};
+    cbm_proc_result_t r;
+    if (cbm_subprocess_run(&opts, &r) != 0) {
+        return -1;
+    }
+    return r.exit_code;
+}
+#endif
+
+TEST(subprocess_strip_git_repo_env_is_per_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    int stripped = gitenv_spawn_probe(true);
+    int inherited = gitenv_spawn_probe(false);
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_EQ(stripped, 0);   /* git vars gone, CBM_GITENV_KEEP passed through */
+    ASSERT_EQ(inherited, 3);  /* without the flag the child inherits as before */
+    ASSERT_TRUE(parent_kept); /* the parent environment is never modified */
+    PASS();
+#endif
+}
+
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd), "echo probe; %s", script);
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    FILE *fp = cbm_popen_git(cmd);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(parent_kept);
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -1284,7 +1490,10 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
+    RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);

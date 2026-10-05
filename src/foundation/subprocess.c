@@ -7,6 +7,7 @@
 
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
+#include "git_env.h" /* strip_git_repo_env: scrubbed child environment for git */
 #include "log.h"
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
@@ -27,7 +28,10 @@
 #include <signal.h>
 #ifdef __APPLE__
 #include <spawn.h>
+#endif
 extern char **environ;
+#ifdef __linux__
+#include <sys/syscall.h> /* SYS_close_range: raw syscall, see cbm_posix_close_fds_from */
 #endif
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -413,6 +417,10 @@ struct cbm_subprocess {
     int cancel_grace_ms;
     size_t memory_limit_bytes;
     bool delete_log_on_exit;
+    bool strip_git_repo_env;
+#ifndef _WIN32
+    char **envp; /* NULL => inherit environ; else the scrubbed git child env */
+#endif
 
     long tail_pos;
     uint64_t last_activity_ms;
@@ -463,6 +471,9 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
     free(process->bin);
     free(process->windows_cmd_payload);
     free(process->log_file);
+#ifndef _WIN32
+    cbm_git_child_env_free(process->envp);
+#endif
     free(process);
 }
 
@@ -531,6 +542,18 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     }
     process->memory_limit_bytes = opts->memory_limit_bytes;
     process->delete_log_on_exit = opts->delete_log_on_exit;
+    process->strip_git_repo_env = opts->strip_git_repo_env;
+#ifndef _WIN32
+    /* Built before the spawn: the fork child may only assign it (malloc is
+     * not async-signal-safe there). Fail closed rather than inherit GIT_DIR. */
+    if (opts->strip_git_repo_env) {
+        process->envp = cbm_git_child_envp();
+        if (!process->envp) {
+            cbm_subprocess_free_config(process);
+            return NULL;
+        }
+    }
+#endif
     atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
     return process;
@@ -746,8 +769,15 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     ZeroMemory(&child, sizeof(child));
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
                   CREATE_NO_WINDOW;
-    BOOL created = CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, NULL, NULL,
+    /* Fail closed: a git child must never inherit a caller's GIT_DIR. */
+    wchar_t *env = process->strip_git_repo_env ? cbm_git_child_env_block() : NULL;
+    if (env) {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
+    BOOL created = (!process->strip_git_repo_env || env) &&
+                   CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
                                   &startup.StartupInfo, &child);
+    cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
     cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
     free(wbin);
     free(wcmdline);
@@ -1042,6 +1072,64 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
+/* Close every descriptor >= lowfd in the fork+exec child (#1484).
+ *
+ * The portable answer is a close() per possible descriptor, which costs
+ * O(RLIMIT_NOFILE) syscalls: at nofile=524288 that is ~0.8 s between fork and
+ * exec for EVERY spawn, independent of how many descriptors are actually open.
+ * The kernel can do the same in one call:
+ *   - Linux >= 5.9: close_range(lowfd, ~0U, 0). Issued as a raw syscall, not
+ *     through the libc wrapper: the static musl release build has no wrapper
+ *     and the glibc wrapper only exists from 2.34, while the syscall number is
+ *     436 on the supported x86-64 and AArch64 targets. Other architectures
+ *     use their header's number, or the loop if no number is available.
+ *     An older kernel answers
+ *     ENOSYS (or EPERM under a seccomp filter that predates it) and we fall back.
+ *   - FreeBSD/OpenBSD/NetBSD/DragonFly: closefrom(lowfd).
+ *   - otherwise (and on fallback): the bounded close() loop.
+ * macOS never reaches this on its primary path: posix_spawn's
+ * CLOEXEC_DEFAULT does the closing (see cbm_posix_spawn_apple).
+ *
+ * Runs between fork and exec, so it is async-signal-safe: raw syscalls and
+ * close() only, no allocation, no stdio. Returns the strategy that did the
+ * work so the test seam can assert which one ran. */
+#if defined(__linux__) && !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_close_range 436
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_force_close_range_enosys = false;
+#endif
+
+static cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd) {
+#if defined(__linux__) && defined(SYS_close_range)
+    bool range_unavailable = false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    range_unavailable = g_force_close_range_enosys;
+#endif
+    if (!range_unavailable && syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0U) == 0) {
+        return CBM_FD_CLOSE_RANGE;
+    }
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    (void)max_fd;
+    closefrom(lowfd);
+    return CBM_FD_CLOSEFROM;
+#endif
+    for (int fd = lowfd; fd < max_fd; fd++) {
+        (void)close(fd);
+    }
+    return CBM_FD_CLOSE_LOOP;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force) {
+    g_force_close_range_enosys = force;
+}
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd) {
+    return cbm_posix_close_fds_from(lowfd, max_fd);
+}
+#endif
+
 /* fork+exec child setup. On Apple this runs ONLY for the exec-failure
  * fallback (see cbm_posix_spawn_apple), which preserves the documented
  * "bogus binary => child exits 127" contract across platforms. */
@@ -1063,8 +1151,9 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     if (output > STDERR_FILENO) {
         (void)close(output);
     }
-    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
-        (void)close(fd);
+    (void)cbm_posix_close_fds_from(STDERR_FILENO + 1, max_fd);
+    if (process->envp) {
+        environ = process->envp; /* execvp passes environ to the new image */
     }
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
@@ -1143,8 +1232,9 @@ static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int outpu
                       posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
                       posix_spawn_file_actions_adddup2(&actions, output, STDERR_FILENO) == 0;
     pid_t pid = -1;
-    int rc =
-        configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv, environ) : -1;
+    int rc = configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv,
+                                       process->envp ? process->envp : environ)
+                        : -1;
     (void)posix_spawn_file_actions_destroy(&actions);
     (void)posix_spawnattr_destroy(&attr);
     if (configured && rc == 0 && pid > 0) {

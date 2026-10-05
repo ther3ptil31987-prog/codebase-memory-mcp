@@ -19,6 +19,7 @@
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "callable_sig.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -33,6 +34,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h" /* CBM_TLS */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -272,12 +274,20 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
 
 static bool pxc_is_jvm_lang(CBMLanguage lang);
 
+/* Leaf of the BASE QN: a callable identity suffix (#2061) never contains
+ * '.', so this equals the historical strrchr split for every QN. */
 static const char *pxc_last_component(const char *qn) {
     if (!qn) {
         return NULL;
     }
-    const char *dot = strrchr(qn, '.');
-    return dot ? dot + 1 : qn;
+    const char *leaf = qn;
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            leaf = qn + i + 1;
+        }
+    }
+    return leaf;
 }
 
 /* Every return is arena-owned: the fallback spelling is a copy, never the
@@ -376,7 +386,9 @@ static const char *pxc_qn_leaf(const char *name) {
         return NULL;
     }
     const char *leaf = name;
-    for (const char *p = name; *p; p++) {
+    /* Base only: a callable identity suffix (#2061) may carry ':' labels. */
+    const char *end = name + cbm_qn_callable_base_len(name);
+    for (const char *p = name; p < end; p++) {
         if (*p == '.' || *p == ':' || *p == '/' || *p == '\\') {
             leaf = p + 1;
         }
@@ -528,6 +540,132 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Python annotation text -> the one type name it declares, or NULL. Strips a
+ * string-literal forward reference and unwraps `Optional[X]`, `X | None` and
+ * `None | X`; anything else with brackets, commas or a real union (generics,
+ * Callable, Union[A, B]) names no single receiver type and is dropped. */
+static const char *pxc_py_annotation_type_name(CBMArena *arena, const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    while (*text == ' ') {
+        text++;
+    }
+    size_t n = strlen(text);
+    while (n > 0 && text[n - 1] == ' ') {
+        n--;
+    }
+    if (n >= 2 && (text[0] == '"' || text[0] == '\'') && text[n - 1] == text[0]) {
+        text++;
+        n -= 2;
+    }
+    static const char *const optional_prefixes[] = {"Optional[", "typing.Optional["};
+    for (size_t i = 0; i < sizeof(optional_prefixes) / sizeof(optional_prefixes[0]); i++) {
+        size_t plen = strlen(optional_prefixes[i]);
+        if (n > plen + 1 && strncmp(text, optional_prefixes[i], plen) == 0 && text[n - 1] == ']') {
+            text += plen;
+            n -= plen + 1;
+            break;
+        }
+    }
+    static const char none_tail[] = " | None";
+    static const char none_head[] = "None | ";
+    const size_t none_len = sizeof(none_tail) - 1;
+    if (n > none_len && strncmp(text + n - none_len, none_tail, none_len) == 0) {
+        n -= none_len;
+    } else if (n > none_len && strncmp(text, none_head, none_len) == 0) {
+        text += none_len;
+        n -= none_len;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = text[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.';
+        if (!ok) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(arena, text, n);
+}
+
+/* Python: fold the file's annotated instance fields (result->field_types,
+ * #1277) into their class defs' field_defs as "name:QN|name:QN", the format
+ * py_register_lsp_defs reads. Each annotation resolves through the same
+ * registry + import map, and the same weak-strategy and type-like vetoes, as
+ * the file's base classes (pxc_resolve_base_qn): a field whose type is not a
+ * confidently-known project type is left out rather than guessed. Linear in
+ * the file: one hash of the file's class defs, one pass over its fields. */
+typedef struct {
+    int owner; /* index into defs[], or -1 */
+    const char *type_qn;
+} pxc_py_field_t;
+
+static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                    int start, int end, const cbm_registry_t *reg,
+                                    const char *module_qn, const char **imp_keys,
+                                    const char **imp_vals, int imp_count) {
+    int nf = result ? result->field_types.count : 0;
+    if (!arena || nf == 0 || !defs || start >= end || !reg) {
+        return;
+    }
+    CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
+    pxc_py_field_t *fields = (pxc_py_field_t *)cbm_arena_alloc(arena, (size_t)nf * sizeof(*fields));
+    /* Per class def: exact buffer size, then the write cursor into it. */
+    size_t *lens = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    size_t *used = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    if (!by_qn || !fields || !lens || !used) {
+        cbm_ht_free(by_qn); /* NULL-safe */
+        return;
+    }
+    memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
+    memset(used, 0, (size_t)(end - start) * sizeof(size_t));
+    for (int si = start; si < end; si++) {
+        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
+            cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
+        }
+    }
+    for (int f = 0; f < nf; f++) {
+        const CBMFieldType *ft = &result->field_types.items[f];
+        fields[f].owner = -1;
+        fields[f].type_qn = NULL;
+        CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
+        const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
+        const char *qn =
+            name ? pxc_resolve_base_qn(reg, name, module_qn, imp_keys, imp_vals, imp_count) : NULL;
+        if (!qn || !ft->field_name || !ft->field_name[0]) {
+            continue;
+        }
+        fields[f].owner = (int)(owner - defs);
+        fields[f].type_qn = qn;
+        /* "name:QN" plus one byte for the '|' or the NUL after it. */
+        lens[fields[f].owner - start] += strlen(ft->field_name) + 1 + strlen(qn) + 1;
+    }
+    cbm_ht_free(by_qn);
+    for (int si = start; si < end; si++) {
+        char *buf = lens[si - start] ? (char *)cbm_arena_alloc(arena, lens[si - start]) : NULL;
+        if (buf) {
+            buf[0] = '\0';
+        }
+        defs[si].field_defs = buf;
+    }
+    for (int f = 0; f < nf; f++) {
+        char *buf = fields[f].owner >= 0 ? (char *)defs[fields[f].owner].field_defs : NULL;
+        if (!buf) {
+            continue;
+        }
+        int slot = fields[f].owner - start;
+        int wrote =
+            snprintf(buf + used[slot], lens[slot] - used[slot], "%s%s:%s", used[slot] ? "|" : "",
+                     result->field_types.items[f].field_name, fields[f].type_qn);
+        if (wrote > 0) {
+            used[slot] += (size_t)wrote;
+        }
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -632,6 +770,10 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                   imp_count) == 0) {
                 idx++;
             }
+        }
+        if (files[fi].language == CBM_LANG_PYTHON) {
+            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, base_reg, def_modules[fi],
+                                    imp_keys, imp_vals, imp_count);
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
@@ -956,6 +1098,73 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     }
 }
 
+/* Per-thread arenas for the per-file scratch below (the walk's overlay and the
+ * append dedup keys), kept rewound between files on a resolve worker that has
+ * promised to drop them at its end (cbm_pxc_thread_scratch_begin/_end).
+ * Opened fresh per file they were 18 k 64 KB-default arenas on the Go corpus,
+ * 1.6 GB allocated and 60 % never written (waste sanitizer, 2026-09-17). An
+ * arena one big file grew past PXC_KEEP_BYTES is dropped, not held; a nested
+ * take finds the slot empty and opens its own. Everywhere else (the sequential
+ * pass) take/give are exactly init/destroy. */
+enum { PXC_SCRATCH_DISPATCH = 0, PXC_SCRATCH_KEYS = 1, PXC_SCRATCH_COUNT = 2 };
+enum { PXC_KEEP_BYTES = 4 * 1024 * 1024 };
+static CBM_TLS bool tl_pxc_keep;
+/* The parked arenas live on the HEAP behind one thread-local pointer. Inline in
+ * thread-local storage they were ~8 KB of static TLS charged to every thread in
+ * the image, and static TLS comes out of each thread's own stack allocation, so
+ * past a certain size a small-stack thread cannot be created at all — which is
+ * precisely how this branch broke the 64 KB parent-death watchdog and, with it,
+ * indexing on x86-64 Linux (PR #2233). The holder is allocated once per
+ * keeping thread, so parking still costs no allocation per file. */
+typedef struct {
+    CBMArena arena[PXC_SCRATCH_COUNT];
+    bool live[PXC_SCRATCH_COUNT];
+} pxc_scratch_t;
+static CBM_TLS pxc_scratch_t *tl_pxc;
+
+static void pxc_scratch_take(int slot, CBMArena *into) {
+    if (tl_pxc && tl_pxc->live[slot]) {
+        *into = tl_pxc->arena[slot];
+        tl_pxc->live[slot] = false;
+        cbm_arena_rewind(into);
+        return;
+    }
+    cbm_arena_init(into);
+}
+
+static void pxc_scratch_give(int slot, CBMArena *from) {
+    if (tl_pxc_keep && from->nblocks > 0 && cbm_arena_capacity(from) <= (size_t)PXC_KEEP_BYTES) {
+        if (!tl_pxc) {
+            tl_pxc = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(pxc_scratch_t));
+        }
+        if (tl_pxc && !tl_pxc->live[slot]) {
+            tl_pxc->arena[slot] = *from;
+            tl_pxc->live[slot] = true;
+            memset(from, 0, sizeof(*from));
+            return;
+        }
+    }
+    cbm_arena_destroy(from);
+}
+
+void cbm_pxc_thread_scratch_begin(void) {
+    tl_pxc_keep = true;
+}
+
+void cbm_pxc_thread_scratch_end(void) {
+    if (tl_pxc) {
+        for (int slot = 0; slot < PXC_SCRATCH_COUNT; slot++) {
+            if (tl_pxc->live[slot]) {
+                cbm_arena_destroy(&tl_pxc->arena[slot]);
+                tl_pxc->live[slot] = false;
+            }
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, tl_pxc);
+        tl_pxc = NULL;
+    }
+    tl_pxc_keep = false;
+}
+
 /* Append cross-file results from `src_out` (allocated in a scratch arena
  * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
  * copying every string field into dst_arena. A manifest-qualified Rust
@@ -980,7 +1189,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         return;
 
     CBMArena keys;
-    cbm_arena_init(&keys);
+    pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
 
     /* Per-file Rust resolution may already have confidently matched the tail
@@ -1073,7 +1282,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     }
 
     cbm_ht_free(seen);
-    cbm_arena_destroy(&keys);
+    pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
 /* Merge exact synthetic call carriers produced by a cross-LSP resolver. The
@@ -1087,7 +1296,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         return;
 
     CBMArena keys;
-    cbm_arena_init(&keys);
+    pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_calls->count + 1));
 
     for (int i = 0; i < dst_calls->count; i++) {
@@ -1146,7 +1355,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
     }
 
     cbm_ht_free(seen);
-    cbm_arena_destroy(&keys);
+    pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
 /* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
@@ -1214,7 +1423,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
-    cbm_arena_init(&scratch);
+    pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
     CBMCallArray synthetic_calls;
@@ -1271,7 +1480,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
-    cbm_arena_destroy(&scratch);
+    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
 /* Variant of cbm_pxc_run_one for TS/JS/JSX/TSX with explicit dialect
@@ -1281,7 +1490,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                         const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode) {
     CBMArena scratch;
-    cbm_arena_init(&scratch);
+    pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
 
@@ -1289,7 +1498,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
-    cbm_arena_destroy(&scratch);
+    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
 /* Parse the project's root Cargo.toml (if present) into `out_m`, using
@@ -1371,7 +1580,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
          * shared registry -- a use-after-free class the moment the arena was
          * not the result arena (ASan, lsp_resolution_probe). */
         CBMArena scratch;
-        cbm_arena_init(&scratch);
+        pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
         CBMTypeRegistry overlay;
         cbm_registry_init(&overlay, &scratch);
         overlay.fallback = prebuilt;
@@ -1452,7 +1661,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }
-        cbm_arena_destroy(&scratch);
+        pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
     }
 
     if (used_prebuilt) {
@@ -1493,7 +1702,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
         if (shared) {
             CBMArena scratch;
-            cbm_arena_init(&scratch);
+            pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
             cbm_run_rust_lsp_cross_with_registry(
@@ -1501,7 +1710,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                 result->cached_tree, cbm_pxc_get_rust_manifest(), &out, &synthetic_calls);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
-            cbm_arena_destroy(&scratch);
+            pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
             cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
                             imp_keys, imp_vals, imp_count);
